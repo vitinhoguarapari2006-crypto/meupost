@@ -1,0 +1,17 @@
+# Dependências (caso use a CLI do Supabase localmente)
+node_modules/
+
+# Variáveis / segredos
+.env
+.env.local
+*.local
+
+# Supabase CLI
+supabase/.branches/
+supabase/.temp/
+
+# SO / editor
+.DS_Store
+.vscode/
+.idea/
+*.log

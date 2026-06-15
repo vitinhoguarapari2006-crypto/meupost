@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#6D28D9" />
+  <title>MeuPost — Agendamento de Redes Sociais</title>
+
+  <!-- Tailwind via Play CDN (mantém tudo num arquivo só) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Supabase JS (só é usado se você conectar um projeto nas Configurações) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    // Paleta da marca (roxo #6D28D9) + tema escuro.
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              DEFAULT: '#6D28D9', 400: '#a78bfa', 500: '#8b5cf6',
+              600: '#7c3aed', 700: '#6d28d9', 800: '#5b21b6', 900: '#4c1d95',
+            },
+            surface: { 900: '#0b0b12', 800: '#13131d', 700: '#1b1b29', 600: '#262637' },
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    body { background: #0b0b12; color: #e5e7eb; font-family: ui-sans-serif, system-ui, 'Segoe UI', Roboto, sans-serif; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-thumb { background: #262637; border-radius: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    .input { width: 100%; border-radius: .5rem; border: 1px solid #262637; background: #13131d; padding: .5rem .75rem; color: #f3f4f6; }
+    .input:focus { outline: none; border-color: #8b5cf6; box-shadow: 0 0 0 1px #8b5cf6; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; border-radius: .5rem; padding: .5rem 1rem; font-weight: 500; transition: .15s; cursor: pointer; border: none; }
+    .btn-brand { background: #6d28d9; color: #fff; } .btn-brand:hover { background: #7c3aed; }
+    .btn-ghost { background: transparent; border: 1px solid #262637; color: #d1d5db; } .btn-ghost:hover { background: #1b1b29; }
+    .card { border-radius: 1rem; border: 1px solid #1b1b29; background: #13131d; }
+    .nav-item { display:flex; align-items:center; gap:.65rem; padding:.6rem .8rem; border-radius:.6rem; color:#9ca3af; cursor:pointer; font-size:.92rem; white-space:nowrap; }
+    .nav-item:hover { background:#1b1b29; color:#e5e7eb; }
+    .nav-item.active { background:#6d28d9; color:#fff; }
+    .badge { font-size:.7rem; padding:.12rem .5rem; border-radius:99px; font-weight:600; }
+  </style>
+</head>
+<body class="min-h-screen">
+  <div id="app"></div>
+
+  <script>
+  // ===========================================================================
+  // MeuPost — app single-file. Roda em modo DEMO (localStorage) e opcionalmente
+  // em modo CLOUD (Supabase) para publicar de verdade via Edge Functions.
+  // Comentários em português.
+  // ===========================================================================
+
+  // ----- Persistência simples (localStorage) --------------------------------
+  const DB = {
+    load(key, def) { try { const v = JSON.parse(localStorage.getItem('meupost.' + key)); return v ?? def; } catch { return def; } },
+    save(key, val) { localStorage.setItem('meupost.' + key, JSON.stringify(val)); },
+  };
+
+  // ----- Estado global -------------------------------------------------------
+  const state = {
+    view: 'dashboard',
+    user: DB.load('user', null),
+    settings: DB.load('settings', {
+      supabaseUrl: '', supabaseAnonKey: '',
+      metaAppId: '', metaRedirectUri: '', graphVersion: 'v25.0',
+      aiProvider: 'mock', openaiKey: '', anthropicKey: '', n8nWebhookAi: '',
+    }),
+    accounts: DB.load('accounts', []),
+    posts: DB.load('posts', []),
+    sb: null,        // cliente Supabase (se configurado)
+    cloud: false,    // true quando conectado ao Supabase
+    editing: null,   // post em edição no editor
+  };
+
+  // ----- Utils ---------------------------------------------------------------
+  const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  const PLATFORMS = {
+    INSTAGRAM: { label: 'Instagram', icon: '📸', color: '#E1306C' },
+    FACEBOOK:  { label: 'Facebook',  icon: '👍', color: '#1877F2' },
+    TIKTOK:    { label: 'TikTok',    icon: '🎵', color: '#69C9D0' },
+  };
+  const POST_TYPES = {
+    IMAGE:        { label: 'Imagem',    platform: 'INSTAGRAM' },
+    REELS:        { label: 'Reels',     platform: 'INSTAGRAM' },
+    CAROUSEL:     { label: 'Carrossel', platform: 'INSTAGRAM' },
+    FB_FEED:      { label: 'Feed FB',   platform: 'FACEBOOK' },
+    TIKTOK_VIDEO: { label: 'Vídeo TikTok', platform: 'TIKTOK' },
+  };
+  const STATUS = {
+    DRAFT:      { label: 'Rascunho',   color: '#9ca3af', bg: 'rgba(156,163,175,.15)' },
+    SCHEDULED:  { label: 'Agendado',   color: '#a78bfa', bg: 'rgba(167,139,250,.15)' },
+    PROCESSING: { label: 'Publicando', color: '#f59e0b', bg: 'rgba(245,158,11,.15)' },
+    PUBLISHED:  { label: 'Publicado',  color: '#22c55e', bg: 'rgba(34,197,94,.15)' },
+    FAILED:     { label: 'Falhou',     color: '#ef4444', bg: 'rgba(239,68,68,.15)' },
+  };
+  const fmtDateTime = (iso) => iso ? new Date(iso).toLocaleString('pt-BR', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }) : '—';
+  const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit' }) : '';
+  const toLocalInput = (iso) => { const d = new Date(iso); const l = new Date(d.getTime() - d.getTimezoneOffset()*60000); return l.toISOString().slice(0,16); };
+  const toast = (msg, type = 'info') => {
+    const el = document.createElement('div');
+    const bg = type === 'error' ? '#7f1d1d' : type === 'ok' ? '#166534' : '#5b21b6';
+    el.className = 'fixed bottom-5 right-5 z-50 px-4 py-3 rounded-lg text-white shadow-2xl text-sm max-w-xs';
+    el.style.background = bg; el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; el.style.transition = '.4s'; }, 2800);
+    setTimeout(() => el.remove(), 3300);
+  };
+
+  // ----- Supabase (modo cloud) ----------------------------------------------
+  function initSupabase() {
+    const { supabaseUrl, supabaseAnonKey } = state.settings;
+    if (supabaseUrl && supabaseAnonKey && window.supabase) {
+      try { state.sb = window.supabase.createClient(supabaseUrl, supabaseAnonKey); state.cloud = true; }
+      catch { state.cloud = false; }
+    } else { state.cloud = false; }
+  }
+  // Chama uma Edge Function do Supabase (publish / scheduler / oauth).
+  async function callEdge(fn, body) {
+    if (!state.cloud) throw new Error('Supabase não configurado.');
+    const { data, error } = await state.sb.functions.invoke(fn, { body });
+    if (error) throw error;
+    return data;
+  }
+
+  function persist() {
+    DB.save('accounts', state.accounts);
+    DB.save('posts', state.posts);
+    DB.save('settings', state.settings);
+    DB.save('user', state.user);
+  }
+
+  // ===========================================================================
+  // AÇÕES
+  // ===========================================================================
+  function login(email) { state.user = { email, role: 'ADMIN', loggedAt: new Date().toISOString() }; persist(); render(); }
+  function logout() { state.user = null; persist(); render(); }
+
+  function connectAccountManual(form) {
+    state.accounts.push({
+      id: uid(), platform: form.platform, accountName: form.accountName,
+      externalId: form.externalId || '', igBusinessId: form.igBusinessId || '',
+      pageId: form.pageId || '', status: 'ACTIVE', createdAt: new Date().toISOString(),
+    });
+    persist(); toast('Conta conectada.', 'ok'); render();
+  }
+  function removeAccount(id) {
+    if (!confirm('Remover esta conta? Os posts ligados a ela continuam no histórico.')) return;
+    state.accounts = state.accounts.filter(a => a.id !== id); persist(); render();
+  }
+
+  // Inicia OAuth do Instagram (precisa do Meta App ID + Edge Function de callback).
+  function startInstagramOAuth() {
+    const s = state.settings;
+    if (!s.metaAppId || !s.metaRedirectUri) { toast('Configure Meta App ID e Redirect URI nas Configurações.', 'error'); return; }
+    const scope = ['instagram_basic','instagram_content_publish','pages_show_list','pages_read_engagement','pages_manage_posts','business_management'].join(',');
+    const url = `https://www.facebook.com/${s.graphVersion}/dialog/oauth?client_id=${encodeURIComponent(s.metaAppId)}&redirect_uri=${encodeURIComponent(s.metaRedirectUri)}&scope=${encodeURIComponent(scope)}&response_type=code`;
+    window.open(url, '_blank');
+    toast('Abrindo login da Meta. O callback é tratado pela Edge Function instagram-oauth.', 'info');
+  }
+
+  function addLog(post, level, message, payload) {
+    (post.logs = post.logs || []).push({ id: uid(), timestamp: new Date().toISOString(), level, message, payload: payload || null });
+  }
+  function savePost(data) {
+    if (data.id) {
+      const p = state.posts.find(x => x.id === data.id);
+      Object.assign(p, data); addLog(p, 'INFO', 'Post atualizado.');
+    } else {
+      const p = {
+        id: uid(), accountId: data.accountId, type: data.type, caption: data.caption,
+        mediaUrls: data.mediaUrls || [], scheduledAt: data.scheduledAt || null,
+        status: data.scheduledAt ? 'SCHEDULED' : 'DRAFT',
+        publishedAt: null, externalPostId: null, errorMessage: null,
+        createdAt: new Date().toISOString(), logs: [],
+      };
+      addLog(p, 'INFO', p.status === 'SCHEDULED' ? `Agendado para ${fmtDateTime(p.scheduledAt)}.` : 'Rascunho criado.');
+      state.posts.push(p);
+    }
+    persist();
+  }
+  function deletePost(id) { if (!confirm('Excluir este post?')) return; state.posts = state.posts.filter(p => p.id !== id); persist(); render(); }
+
+  // Publica um post agora (cloud: Edge Function; demo: simula).
+  async function publishNow(post) {
+    post.status = 'PROCESSING'; addLog(post, 'INFO', 'Iniciando publicação...'); persist(); render();
+    try {
+      if (state.cloud) {
+        const acc = state.accounts.find(a => a.id === post.accountId);
+        const res = await callEdge('publish', { post, account: acc });
+        post.externalPostId = res.id || res.externalPostId || null;
+      } else {
+        await new Promise(r => setTimeout(r, 900));
+        post.externalPostId = 'demo_' + uid();
+        addLog(post, 'INFO', '[DEMO] Publicação simulada — conecte o Supabase para publicar de verdade.');
+      }
+      post.status = 'PUBLISHED'; post.publishedAt = new Date().toISOString();
+      addLog(post, 'INFO', 'Publicado. ID externo: ' + post.externalPostId);
+      toast('Post publicado.', 'ok');
+    } catch (e) {
+      post.status = 'FAILED'; post.errorMessage = e.message || String(e);
+      addLog(post, 'ERROR', 'Falha: ' + post.errorMessage);
+      toast('Falha ao publicar: ' + post.errorMessage, 'error');
+    }
+    persist(); render();
+  }
+
+  // Scheduler client-side: enquanto a aba está aberta, publica posts vencidos.
+  // (No cloud REAL, quem dispara no horário é o pg_cron no Supabase — isto é só
+  // um empurrãozinho enquanto a página está aberta.)
+  async function runScheduler() {
+    const now = Date.now();
+    const due = state.posts.filter(p => p.status === 'SCHEDULED' && p.scheduledAt && new Date(p.scheduledAt).getTime() <= now);
+    for (const p of due) await publishNow(p);
+  }
+
+  // Geração de legenda com IA (provider configurável).
+  async function generateCaption({ tema, tom, publico, variacoes }) {
+    const s = state.settings;
+    if (s.aiProvider === 'n8n' && s.n8nWebhookAi) {
+      const r = await fetch(s.n8nWebhookAi, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tema, tom, publico, variacoes }) });
+      const data = await r.json(); return data.variations || data.variacoes || [];
+    }
+    if (s.aiProvider === 'openai' && s.openaiKey) {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + s.openaiKey },
+        body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: `Crie ${variacoes} legendas para Instagram. Tema: ${tema}. Tom: ${tom}. Público: ${publico}. Responda só as legendas, uma por linha, sem numeração.` }] }),
+      });
+      const data = await r.json(); return (data.choices?.[0]?.message?.content || '').split('\n').map(s=>s.trim()).filter(Boolean);
+    }
+    // MOCK local (sem custo, pra testar a UI).
+    await new Promise(r => setTimeout(r, 600));
+    const base = tema || 'seu conteúdo';
+    const templates = [
+      `✨ ${base}: a transformação que ${publico || 'você'} esperava.`,
+      `🚀 Pare de adiar. ${base} do jeito certo, com tom ${tom || 'direto'}. Bora?`,
+      `Você sabia? ${base} pode mudar o jogo. Salva esse post! 💜`,
+      `O segredo de ${base} que ninguém te conta 👇 #${(base||'dica').replace(/\s+/g,'')}`,
+      `${publico || 'Quem'} precisa ver isto sobre ${base}. Marca alguém! 🔥`,
+      `3 motivos pra começar ${base} hoje. O terceiro surpreende.`,
+    ];
+    return Array.from({ length: variacoes }, (_, i) => templates[i % templates.length]);
+  }
+
+  // Agendamento em massa: distribui N posts a partir de uma data/horários.
+  function bulkSchedule({ accountId, type, mediaUrls, captionBase, startDate, times, perDay }) {
+    let cursor = new Date(startDate + 'T00:00:00'); let dayCount = 0; let created = 0;
+    mediaUrls.forEach((url, idx) => {
+      const time = times[idx % times.length]; const [h, m] = time.split(':').map(Number);
+      const d = new Date(cursor); d.setHours(h, m, 0, 0);
+      const p = {
+        id: uid(), accountId, type, caption: captionBase || '', mediaUrls: [url],
+        scheduledAt: d.toISOString(), status: 'SCHEDULED',
+        publishedAt: null, externalPostId: null, errorMessage: null,
+        createdAt: new Date().toISOString(), logs: [],
+      };
+      addLog(p, 'INFO', `Agendado (massa) para ${fmtDateTime(p.scheduledAt)}.`);
+      state.posts.push(p); created++; dayCount++;
+      if (dayCount >= perDay) { dayCount = 0; cursor.setDate(cursor.getDate() + 1); }
+    });
+    persist(); toast(`${created} posts agendados.`, 'ok');
+  }
+
+  // ===========================================================================
+  // RENDER
+  // ===========================================================================
+  const root = () => document.getElementById('app');
+
+  function render() {
+    if (!state.user) { root().innerHTML = LoginView(); bindLogin(); return; }
+    root().innerHTML = Shell(ViewRouter());
+    bindShell(); bindView();
+  }
+  function ViewRouter() {
+    switch (state.view) {
+      case 'dashboard': return DashboardView();
+      case 'calendar':  return CalendarView();
+      case 'compose':   return ComposeView();
+      case 'bulk':      return BulkView();
+      case 'accounts':  return AccountsView();
+      case 'logs':      return LogsView();
+      case 'settings':  return SettingsView();
+      default:          return DashboardView();
+    }
+  }
+
+  // ----- Login ---------------------------------------------------------------
+  function LoginView() {
+    return `
+    <div class="min-h-screen flex items-center justify-center p-4">
+      <div class="w-full max-w-md">
+        <div class="text-center mb-8">
+          <div class="mx-auto mb-3 h-14 w-14 rounded-2xl bg-brand-700 flex items-center justify-center text-2xl font-bold">M</div>
+          <h1 class="text-2xl font-semibold">MeuPost</h1>
+          <p class="text-sm text-gray-400 mt-1">Painel administrativo — agendamento de redes sociais</p>
+        </div>
+        <form id="loginForm" class="card p-6 space-y-4">
+          <div><label class="text-sm text-gray-300 block mb-1">Email</label>
+            <input id="email" type="email" class="input" placeholder="admin@meupost.local" required /></div>
+          <div><label class="text-sm text-gray-300 block mb-1">Senha</label>
+            <input id="password" type="password" class="input" placeholder="••••••••" required /></div>
+          <button class="btn btn-brand w-full">Entrar</button>
+          <p class="text-xs text-gray-500 text-center">Modo demo: qualquer email/senha entra. Conecte o Supabase nas Configurações para login real.</p>
+        </form>
+      </div>
+    </div>`;
+  }
+  function bindLogin() {
+    document.getElementById('loginForm').addEventListener('submit', (e) => {
+      e.preventDefault(); login(document.getElementById('email').value.trim());
+    });
+  }
+
+  // ----- Shell ---------------------------------------------------------------
+  function Shell(content) {
+    const nav = [
+      ['dashboard','📊','Dashboard'],['calendar','🗓️','Calendário'],['compose','✏️','Novo Post'],
+      ['bulk','📦','Em Massa'],['accounts','🔗','Contas'],['logs','📜','Logs'],['settings','⚙️','Config'],
+    ].map(([id, icon, label]) => `<div class="nav-item ${state.view === id ? 'active' : ''}" data-nav="${id}"><span>${icon}</span><span>${label}</span></div>`).join('');
+    const modeBadge = state.cloud
+      ? `<span class="badge" style="background:rgba(34,197,94,.15);color:#22c55e">● Cloud (Supabase)</span>`
+      : `<span class="badge" style="background:rgba(245,158,11,.15);color:#f59e0b">● Demo (local)</span>`;
+    return `
+    <div class="flex min-h-screen">
+      <aside class="w-56 shrink-0 border-r border-surface-700 bg-surface-800 p-3 hidden md:flex flex-col">
+        <div class="flex items-center gap-2 px-2 py-3">
+          <div class="h-9 w-9 rounded-lg bg-brand-700 flex items-center justify-center font-bold">M</div>
+          <span class="font-semibold">MeuPost</span>
+        </div>
+        <nav class="space-y-1 mt-2">${nav}</nav>
+        <div class="mt-auto px-2 pt-4">${modeBadge}</div>
+      </aside>
+      <main class="flex-1 min-w-0">
+        <header class="border-b border-surface-700 bg-surface-800/60 sticky top-0 z-10">
+          <div class="flex items-center justify-between px-5 py-3">
+            <div class="md:hidden h-8 w-8 rounded-lg bg-brand-700 flex items-center justify-center font-bold text-sm">M</div>
+            <div class="flex-1"></div>
+            <div class="flex items-center gap-3">
+              <span class="text-sm text-gray-400 hidden sm:block">${esc(state.user.email)}</span>
+              <button class="btn btn-ghost text-sm py-1.5" data-action="logout">Sair</button>
+            </div>
+          </div>
+          <nav class="flex md:hidden gap-1 px-3 pb-2 overflow-x-auto">${nav}</nav>
+        </header>
+        <div class="p-5 max-w-6xl mx-auto">${content}</div>
+      </main>
+    </div>`;
+  }
+  function bindShell() {
+    document.querySelectorAll('[data-nav]').forEach(el => el.addEventListener('click', () => { state.editing = null; state.view = el.dataset.nav; render(); }));
+    document.querySelectorAll('[data-action="logout"]').forEach(el => el.addEventListener('click', logout));
+  }
+
+  // ----- Dashboard -----------------------------------------------------------
+  function DashboardView() {
+    const count = (st) => state.posts.filter(p => p.status === st).length;
+    const upcoming = state.posts.filter(p => p.status === 'SCHEDULED').sort((a,b) => new Date(a.scheduledAt) - new Date(b.scheduledAt)).slice(0, 6);
+    const stat = (label, value, color) => `<div class="card p-5"><p class="text-sm text-gray-400">${label}</p><p class="text-3xl font-semibold mt-2" style="color:${color}">${value}</p></div>`;
+    return `
+      <h1 class="text-2xl font-semibold">Visão geral</h1>
+      <p class="text-sm text-gray-400 mt-1">Olá, Admin. ${state.cloud ? 'Conectado ao Supabase.' : 'Rodando em modo demo (dados no navegador).'}</p>
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mt-5">
+        ${stat('Agendados', count('SCHEDULED'), '#a78bfa')}
+        ${stat('Publicados', count('PUBLISHED'), '#22c55e')}
+        ${stat('Falhas', count('FAILED'), '#ef4444')}
+        ${stat('Contas', state.accounts.length, '#8b5cf6')}
+      </div>
+      <div class="card p-5 mt-5">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-medium">Próximos agendamentos</h2>
+          <button class="btn btn-brand text-sm py-1.5" data-nav-jump="compose">+ Novo post</button>
+        </div>
+        ${upcoming.length ? `<div class="divide-y divide-surface-700">${upcoming.map(rowPost).join('')}</div>` : `<p class="text-sm text-gray-500 py-6 text-center">Nenhum post agendado ainda.</p>`}
+      </div>`;
+  }
+  function rowPost(p) {
+    const acc = state.accounts.find(a => a.id === p.accountId); const st = STATUS[p.status];
+    return `
+      <div class="flex items-center justify-between py-3 gap-3">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="badge" style="background:${st.bg};color:${st.color}">${st.label}</span>
+            <span class="text-sm text-gray-400">${POST_TYPES[p.type]?.label || p.type}</span>
+            ${acc ? `<span class="text-xs text-gray-500">${PLATFORMS[acc.platform]?.icon || ''} ${esc(acc.accountName)}</span>` : ''}
+          </div>
+          <p class="text-sm text-gray-300 truncate mt-1">${p.caption ? esc(p.caption) : '<span class="text-gray-600">sem legenda</span>'}</p>
+        </div>
+        <div class="text-right shrink-0">
+          <p class="text-xs text-gray-400">${fmtDateTime(p.scheduledAt)}</p>
+          <div class="flex gap-2 justify-end mt-1">
+            <button class="text-xs text-brand-400 hover:underline" data-edit="${p.id}">editar</button>
+            <button class="text-xs text-gray-500 hover:text-red-400" data-del="${p.id}">excluir</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // ----- Calendário ----------------------------------------------------------
+  let calRef = new Date();
+  function CalendarView() {
+    const y = calRef.getFullYear(), m = calRef.getMonth();
+    const startDay = new Date(y, m, 1).getDay();
+    const days = new Date(y, m + 1, 0).getDate();
+    const monthName = calRef.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+    const cells = [];
+    for (let i = 0; i < startDay; i++) cells.push('<div></div>');
+    for (let d = 1; d <= days; d++) {
+      const dayPosts = state.posts.filter(p => { const ds = p.scheduledAt || p.publishedAt; if (!ds) return false; const pd = new Date(ds); return pd.getFullYear()===y && pd.getMonth()===m && pd.getDate()===d; });
+      const dots = dayPosts.slice(0, 4).map(p => `<button data-edit="${p.id}" title="${esc(p.caption)}" class="block w-full text-left truncate text-[10px] px-1 py-0.5 rounded mb-0.5" style="background:${STATUS[p.status].bg};color:${STATUS[p.status].color}">${fmtTime(p.scheduledAt)} ${POST_TYPES[p.type]?.label||''}</button>`).join('');
+      const more = dayPosts.length > 4 ? `<span class="text-[10px] text-gray-500">+${dayPosts.length - 4}</span>` : '';
+      cells.push(`<div class="min-h-[88px] border border-surface-700 rounded-lg p-1.5"><div class="text-xs text-gray-500 mb-1">${d}</div>${dots}${more}</div>`);
+    }
+    const weekdays = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'].map(w => `<div class="text-xs text-gray-500 text-center pb-1">${w}</div>`).join('');
+    return `
+      <div class="flex items-center justify-between mb-4">
+        <h1 class="text-2xl font-semibold capitalize">${monthName}</h1>
+        <div class="flex gap-2">
+          <button class="btn btn-ghost py-1.5" data-cal="prev">←</button>
+          <button class="btn btn-ghost py-1.5" data-cal="today">Hoje</button>
+          <button class="btn btn-ghost py-1.5" data-cal="next">→</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-7 gap-1">${weekdays}${cells.join('')}</div>
+      <p class="text-xs text-gray-500 mt-3">Clique num post para editar. Drag-and-drop de reagendamento entra numa próxima fase.</p>`;
+  }
+
+  // ----- Editor de post ------------------------------------------------------
+  function ComposeView() {
+    const p = state.editing || {};
+    if (!state.accounts.length) {
+      return `<div class="card p-8 text-center"><p class="text-gray-400">Conecte uma conta primeiro para criar posts.</p><button class="btn btn-brand mt-4" data-nav-jump="accounts">Ir para Contas</button></div>`;
+    }
+    const accOpts = state.accounts.map(a => `<option value="${a.id}" ${p.accountId===a.id?'selected':''}>${PLATFORMS[a.platform]?.icon||''} ${esc(a.accountName)}</option>`).join('');
+    const typeOpts = Object.entries(POST_TYPES).map(([k,v]) => `<option value="${k}" ${p.type===k?'selected':''}>${v.label}</option>`).join('');
+    const media = (p.mediaUrls || []).map((u,i) => mediaThumb(u,i)).join('');
+    return `
+      <h1 class="text-2xl font-semibold">${p.id ? 'Editar post' : 'Novo post'}</h1>
+      <div class="grid lg:grid-cols-3 gap-5 mt-5">
+        <div class="lg:col-span-2 space-y-4">
+          <div class="card p-5 space-y-4">
+            <div class="grid sm:grid-cols-2 gap-4">
+              <div><label class="text-sm text-gray-300 block mb-1">Conta</label><select id="f-account" class="input">${accOpts}</select></div>
+              <div><label class="text-sm text-gray-300 block mb-1">Tipo</label><select id="f-type" class="input">${typeOpts}</select></div>
+            </div>
+            <div>
+              <label class="text-sm text-gray-300 block mb-1">Mídia (imagens/vídeos)</label>
+              <input id="f-media" type="file" accept="image/*,video/*" multiple class="input" />
+              <div id="mediaPreview" class="flex flex-wrap gap-2 mt-3">${media}</div>
+              <p class="text-xs text-gray-500 mt-2">No cloud, a mídia sobe pro Supabase Storage (URL pública). No demo, fica no navegador.</p>
+            </div>
+            <div>
+              <div class="flex items-center justify-between mb-1">
+                <label class="text-sm text-gray-300">Legenda</label>
+                <button type="button" class="text-xs text-brand-400 hover:underline" id="btnAi">✨ Gerar com IA</button>
+              </div>
+              <textarea id="f-caption" rows="5" class="input" placeholder="Escreva a legenda...">${esc(p.caption || '')}</textarea>
+            </div>
+            <div><label class="text-sm text-gray-300 block mb-1">Data/hora de publicação</label>
+              <input id="f-date" type="datetime-local" class="input" value="${p.scheduledAt ? toLocalInput(p.scheduledAt) : ''}" /></div>
+          </div>
+          <div class="flex gap-3 flex-wrap">
+            <button class="btn btn-brand" id="btnSchedule">Agendar</button>
+            <button class="btn btn-ghost" id="btnDraft">Salvar rascunho</button>
+            ${p.id ? `<button class="btn btn-ghost" id="btnPublishNow">Publicar agora</button>` : ''}
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="card p-5">
+            <h3 class="font-medium mb-2">Pré-visualização</h3>
+            <div class="rounded-xl border border-surface-700 overflow-hidden">
+              <div class="p-3 flex items-center gap-2 border-b border-surface-700">
+                <div class="h-7 w-7 rounded-full bg-brand-700"></div>
+                <span class="text-sm" id="prevAcc">conta</span>
+              </div>
+              <div id="prevMedia" class="aspect-square bg-surface-900 flex items-center justify-center text-gray-600 text-sm">prévia da mídia</div>
+              <div class="p-3 text-sm text-gray-300 break-words" id="prevCaption">legenda...</div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+  }
+  function mediaThumb(url, i) {
+    const isVid = /video/i.test(url) || url.startsWith('data:video');
+    return `<div class="relative">${isVid ? `<video src="${url}" class="h-20 w-20 object-cover rounded-lg"></video>` : `<img src="${url}" class="h-20 w-20 object-cover rounded-lg" />`}<button data-rmmedia="${i}" class="absolute -top-1 -right-1 bg-red-600 text-white rounded-full w-5 h-5 text-xs leading-none">×</button></div>`;
+  }
+
+  // ----- Em massa ------------------------------------------------------------
+  function BulkView() {
+    if (!state.accounts.length) return `<div class="card p-8 text-center"><p class="text-gray-400">Conecte uma conta primeiro.</p><button class="btn btn-brand mt-4" data-nav-jump="accounts">Ir para Contas</button></div>`;
+    const accOpts = state.accounts.map(a => `<option value="${a.id}">${PLATFORMS[a.platform]?.icon||''} ${esc(a.accountName)}</option>`).join('');
+    const typeOpts = Object.entries(POST_TYPES).map(([k,v]) => `<option value="${k}">${v.label}</option>`).join('');
+    return `
+      <h1 class="text-2xl font-semibold">Agendamento em massa</h1>
+      <p class="text-sm text-gray-400 mt-1">Suba várias mídias e distribua automaticamente nos horários.</p>
+      <div class="card p-5 mt-5 space-y-4 max-w-2xl">
+        <div class="grid sm:grid-cols-2 gap-4">
+          <div><label class="text-sm text-gray-300 block mb-1">Conta</label><select id="b-account" class="input">${accOpts}</select></div>
+          <div><label class="text-sm text-gray-300 block mb-1">Tipo</label><select id="b-type" class="input">${typeOpts}</select></div>
+        </div>
+        <div><label class="text-sm text-gray-300 block mb-1">Mídias</label><input id="b-media" type="file" accept="image/*,video/*" multiple class="input" /><div id="bPreview" class="flex flex-wrap gap-2 mt-2"></div></div>
+        <div><label class="text-sm text-gray-300 block mb-1">Legenda padrão (opcional)</label><textarea id="b-caption" rows="2" class="input"></textarea></div>
+        <div class="grid sm:grid-cols-3 gap-4">
+          <div><label class="text-sm text-gray-300 block mb-1">A partir de</label><input id="b-start" type="date" class="input" value="${new Date().toISOString().slice(0,10)}" /></div>
+          <div><label class="text-sm text-gray-300 block mb-1">Horários (vírgula)</label><input id="b-times" class="input" value="09:00, 12:00, 18:00" /></div>
+          <div><label class="text-sm text-gray-300 block mb-1">Posts por dia</label><input id="b-perday" type="number" class="input" value="3" min="1" /></div>
+        </div>
+        <button class="btn btn-brand" id="btnBulk">Agendar tudo</button>
+      </div>`;
+  }
+
+  // ----- Contas --------------------------------------------------------------
+  function AccountsView() {
+    const list = state.accounts.map(a => {
+      const pl = PLATFORMS[a.platform];
+      return `<div class="card p-4 flex items-center justify-between">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="h-10 w-10 rounded-lg flex items-center justify-center text-xl shrink-0" style="background:${pl.color}22">${pl.icon}</div>
+          <div class="min-w-0"><p class="font-medium truncate">${esc(a.accountName)}</p><p class="text-xs text-gray-500 truncate">${pl.label} ${a.igBusinessId ? '· IG '+esc(a.igBusinessId) : ''}</p></div>
+        </div>
+        <div class="flex items-center gap-3 shrink-0">
+          <span class="badge" style="background:rgba(34,197,94,.15);color:#22c55e">${a.status}</span>
+          <button class="text-xs text-gray-500 hover:text-red-400" data-rmacc="${a.id}">remover</button>
+        </div>
+      </div>`;
+    }).join('');
+    return `
+      <h1 class="text-2xl font-semibold">Contas conectadas</h1>
+      <div class="grid md:grid-cols-2 gap-5 mt-5">
+        <div class="space-y-3">${state.accounts.length ? list : '<div class="card p-6 text-center text-gray-500 text-sm">Nenhuma conta conectada.</div>'}</div>
+        <div class="card p-5 space-y-4 h-fit">
+          <h3 class="font-medium">Conectar via OAuth</h3>
+          <button class="btn btn-brand w-full" id="btnOauthIg">📸 Conectar Instagram (Meta Login)</button>
+          <p class="text-xs text-gray-500">Requer Meta App ID + Edge Function. Configure nas Configurações.</p>
+          <hr class="border-surface-700" />
+          <h3 class="font-medium">Adicionar manualmente</h3>
+          <select id="m-platform" class="input">${Object.entries(PLATFORMS).map(([k,v]) => `<option value="${k}">${v.icon} ${v.label}</option>`).join('')}</select>
+          <input id="m-name" class="input" placeholder="Nome da conta (ex: @minhaagencia)" />
+          <input id="m-ext" class="input" placeholder="External ID (opcional)" />
+          <input id="m-ig" class="input" placeholder="IG Business ID (opcional)" />
+          <input id="m-page" class="input" placeholder="Facebook Page ID (opcional)" />
+          <button class="btn btn-ghost w-full" id="btnAddManual">Adicionar conta</button>
+        </div>
+      </div>`;
+  }
+
+  // ----- Logs ----------------------------------------------------------------
+  function LogsView() {
+    const all = state.posts.flatMap(p => (p.logs||[]).map(l => ({ ...l, post: p }))).sort((a,b) => new Date(b.timestamp) - new Date(a.timestamp)).slice(0, 200);
+    return `
+      <div class="flex items-center justify-between">
+        <h1 class="text-2xl font-semibold">Logs</h1>
+        <button class="btn btn-ghost py-1.5 text-sm" data-action="refresh">Atualizar</button>
+      </div>
+      <div class="card mt-5 divide-y divide-surface-700">
+        ${all.length ? all.map(l => `
+          <div class="flex items-start gap-3 p-3">
+            <span class="badge mt-0.5" style="background:${l.level==='ERROR'?'rgba(239,68,68,.15)':'rgba(99,102,241,.15)'};color:${l.level==='ERROR'?'#ef4444':'#a5b4fc'}">${l.level}</span>
+            <div class="min-w-0 flex-1">
+              <p class="text-sm break-words">${esc(l.message)}</p>
+              <p class="text-xs text-gray-500">${fmtDateTime(l.timestamp)} · ${POST_TYPES[l.post.type]?.label||''} · ${esc((l.post.caption||'').slice(0,40))}</p>
+            </div>
+          </div>`).join('') : '<p class="p-6 text-center text-gray-500 text-sm">Sem logs ainda.</p>'}
+      </div>`;
+  }
+
+  // ----- Configurações -------------------------------------------------------
+  function SettingsView() {
+    const s = state.settings;
+    return `
+      <h1 class="text-2xl font-semibold">Configurações</h1>
+      <div class="grid lg:grid-cols-2 gap-5 mt-5">
+        <div class="card p-5 space-y-3">
+          <h3 class="font-medium">Supabase (modo cloud)</h3>
+          <p class="text-xs text-gray-500">Cole a URL e a anon key do seu projeto. Habilita login real, sync e publicação via Edge Functions.</p>
+          <input id="s-suburl" class="input" placeholder="https://xxxx.supabase.co" value="${esc(s.supabaseUrl)}" />
+          <input id="s-subkey" class="input" placeholder="anon public key" value="${esc(s.supabaseAnonKey)}" />
+        </div>
+        <div class="card p-5 space-y-3">
+          <h3 class="font-medium">Meta / Instagram</h3>
+          <input id="s-appid" class="input" placeholder="Meta App ID" value="${esc(s.metaAppId)}" />
+          <input id="s-redir" class="input" placeholder="Redirect URI (Edge Function instagram-oauth)" value="${esc(s.metaRedirectUri)}" />
+          <input id="s-graph" class="input" placeholder="Graph version" value="${esc(s.graphVersion)}" />
+        </div>
+        <div class="card p-5 space-y-3">
+          <h3 class="font-medium">Legendas com IA</h3>
+          <select id="s-aiprov" class="input">${['mock','openai','n8n'].map(o => `<option value="${o}" ${s.aiProvider===o?'selected':''}>${o}</option>`).join('')}</select>
+          <input id="s-openai" class="input" placeholder="OpenAI API key (cuidado: fica no navegador)" value="${esc(s.openaiKey)}" />
+          <input id="s-n8nai" class="input" placeholder="Webhook n8n p/ legendas" value="${esc(s.n8nWebhookAi)}" />
+        </div>
+        <div class="card p-5 space-y-3">
+          <h3 class="font-medium">Dados</h3>
+          <p class="text-xs text-gray-500">Exporte/importe seus dados locais (contas, posts, config).</p>
+          <div class="flex gap-2 flex-wrap">
+            <button class="btn btn-ghost text-sm" id="btnExport">Exportar JSON</button>
+            <button class="btn btn-ghost text-sm" id="btnImport">Importar JSON</button>
+            <button class="btn btn-ghost text-sm" id="btnWipe">Limpar tudo</button>
+          </div>
+        </div>
+      </div>
+      <button class="btn btn-brand mt-5" id="btnSaveSettings">Salvar configurações</button>`;
+  }
+
+  // ===========================================================================
+  // BINDINGS por view
+  // ===========================================================================
+  function bindView() {
+    document.querySelectorAll('[data-nav-jump]').forEach(el => el.addEventListener('click', () => { state.editing = null; state.view = el.dataset.navJump; render(); }));
+    document.querySelectorAll('[data-edit]').forEach(el => el.addEventListener('click', () => { state.editing = state.posts.find(p => p.id === el.dataset.edit); state.view = 'compose'; render(); }));
+    document.querySelectorAll('[data-del]').forEach(el => el.addEventListener('click', () => deletePost(el.dataset.del)));
+    if (state.view === 'calendar') bindCalendar();
+    if (state.view === 'compose') bindCompose();
+    if (state.view === 'bulk') bindBulk();
+    if (state.view === 'accounts') bindAccounts();
+    if (state.view === 'logs') document.querySelectorAll('[data-action="refresh"]').forEach(el => el.addEventListener('click', render));
+    if (state.view === 'settings') bindSettings();
+  }
+  function bindCalendar() {
+    document.querySelectorAll('[data-cal]').forEach(el => el.addEventListener('click', () => {
+      const a = el.dataset.cal;
+      if (a === 'prev') calRef.setMonth(calRef.getMonth() - 1);
+      if (a === 'next') calRef.setMonth(calRef.getMonth() + 1);
+      if (a === 'today') calRef = new Date();
+      render();
+    }));
+  }
+  function bindCompose() {
+    const p = state.editing || {};
+    let mediaUrls = (p.mediaUrls || []).slice();
+    const refreshPreview = () => {
+      const accId = document.getElementById('f-account').value;
+      const acc = state.accounts.find(a => a.id === accId);
+      document.getElementById('prevAcc').textContent = acc ? acc.accountName : 'conta';
+      document.getElementById('prevCaption').textContent = document.getElementById('f-caption').value || 'legenda...';
+      const pm = document.getElementById('prevMedia');
+      if (mediaUrls[0]) {
+        const isVid = /video/i.test(mediaUrls[0]) || mediaUrls[0].startsWith('data:video');
+        pm.innerHTML = isVid ? `<video src="${mediaUrls[0]}" class="w-full h-full object-cover" muted></video>` : `<img src="${mediaUrls[0]}" class="w-full h-full object-cover" />`;
+      }
+    };
+    const refreshThumbs = () => {
+      document.getElementById('mediaPreview').innerHTML = mediaUrls.map((u,i) => mediaThumb(u,i)).join('');
+      document.querySelectorAll('[data-rmmedia]').forEach(b => b.addEventListener('click', () => { mediaUrls.splice(+b.dataset.rmmedia,1); refreshThumbs(); refreshPreview(); }));
+      refreshPreview();
+    };
+    document.getElementById('f-media').addEventListener('change', async (e) => {
+      for (const file of e.target.files) mediaUrls.push(state.cloud ? await uploadToSupabase(file) : await fileToDataUrl(file));
+      refreshThumbs();
+    });
+    ['f-account','f-caption'].forEach(id => document.getElementById(id).addEventListener('input', refreshPreview));
+    refreshThumbs();
+    const collect = () => ({
+      id: p.id,
+      accountId: document.getElementById('f-account').value,
+      type: document.getElementById('f-type').value,
+      caption: document.getElementById('f-caption').value,
+      mediaUrls,
+      scheduledAt: document.getElementById('f-date').value ? new Date(document.getElementById('f-date').value).toISOString() : null,
+    });
+    document.getElementById('btnSchedule').addEventListener('click', () => {
+      const d = collect();
+      if (!d.scheduledAt) { toast('Defina data/hora para agendar.', 'error'); return; }
+      if (!d.mediaUrls.length) { toast('Adicione ao menos uma mídia.', 'error'); return; }
+      savePost(d); state.editing = null; state.view = 'dashboard'; toast('Post agendado.', 'ok'); render();
+    });
+    document.getElementById('btnDraft').addEventListener('click', () => {
+      const d = collect(); d.scheduledAt = null; savePost(d); state.editing = null; state.view = 'dashboard'; render();
+    });
+    const pubBtn = document.getElementById('btnPublishNow');
+    if (pubBtn) pubBtn.addEventListener('click', async () => { savePost(collect()); await publishNow(state.posts.find(x => x.id === p.id)); state.editing = null; state.view = 'dashboard'; render(); });
+    document.getElementById('btnAi').addEventListener('click', () => openAiModal((txt) => { document.getElementById('f-caption').value = txt; refreshPreview(); }));
+  }
+  function bindBulk() {
+    let urls = [];
+    document.getElementById('b-media').addEventListener('change', async (e) => {
+      urls = [];
+      for (const file of e.target.files) urls.push(state.cloud ? await uploadToSupabase(file) : await fileToDataUrl(file));
+      document.getElementById('bPreview').innerHTML = urls.map((u,i) => mediaThumb(u,i)).join('');
+    });
+    document.getElementById('btnBulk').addEventListener('click', () => {
+      if (!urls.length) { toast('Suba pelo menos uma mídia.', 'error'); return; }
+      bulkSchedule({
+        accountId: document.getElementById('b-account').value,
+        type: document.getElementById('b-type').value,
+        mediaUrls: urls,
+        captionBase: document.getElementById('b-caption').value,
+        startDate: document.getElementById('b-start').value,
+        times: document.getElementById('b-times').value.split(',').map(s => s.trim()).filter(Boolean),
+        perDay: Math.max(1, parseInt(document.getElementById('b-perday').value) || 1),
+      });
+      state.view = 'calendar'; render();
+    });
+  }
+  function bindAccounts() {
+    document.getElementById('btnOauthIg').addEventListener('click', startInstagramOAuth);
+    document.getElementById('btnAddManual').addEventListener('click', () => {
+      const name = document.getElementById('m-name').value.trim();
+      if (!name) { toast('Informe o nome da conta.', 'error'); return; }
+      connectAccountManual({
+        platform: document.getElementById('m-platform').value, accountName: name,
+        externalId: document.getElementById('m-ext').value.trim(),
+        igBusinessId: document.getElementById('m-ig').value.trim(),
+        pageId: document.getElementById('m-page').value.trim(),
+      });
+    });
+    document.querySelectorAll('[data-rmacc]').forEach(b => b.addEventListener('click', () => removeAccount(b.dataset.rmacc)));
+  }
+  function bindSettings() {
+    document.getElementById('btnSaveSettings').addEventListener('click', () => {
+      Object.assign(state.settings, {
+        supabaseUrl: val('s-suburl'), supabaseAnonKey: val('s-subkey'),
+        metaAppId: val('s-appid'), metaRedirectUri: val('s-redir'), graphVersion: val('s-graph') || 'v25.0',
+        aiProvider: val('s-aiprov'), openaiKey: val('s-openai'), n8nWebhookAi: val('s-n8nai'),
+      });
+      persist(); initSupabase(); toast(state.cloud ? 'Salvo. Conectado ao Supabase.' : 'Configurações salvas.', 'ok'); render();
+    });
+    document.getElementById('btnExport').addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify({ accounts: state.accounts, posts: state.posts, settings: state.settings }, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'meupost-backup.json'; a.click();
+    });
+    document.getElementById('btnImport').addEventListener('click', () => {
+      const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'application/json';
+      inp.onchange = () => { const fr = new FileReader(); fr.onload = () => { try { const d = JSON.parse(fr.result); state.accounts = d.accounts||[]; state.posts = d.posts||[]; Object.assign(state.settings, d.settings||{}); persist(); toast('Importado.', 'ok'); render(); } catch { toast('Arquivo inválido.', 'error'); } }; fr.readAsText(inp.files[0]); };
+      inp.click();
+    });
+    document.getElementById('btnWipe').addEventListener('click', () => { if (confirm('Apagar TODOS os dados locais?')) { localStorage.clear(); location.reload(); } });
+  }
+  const val = (id) => document.getElementById(id).value.trim();
+
+  // ----- Modal de IA ---------------------------------------------------------
+  function openAiModal(onPick) {
+    const wrap = document.createElement('div');
+    wrap.className = 'fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4';
+    wrap.innerHTML = `
+      <div class="card p-5 w-full max-w-lg">
+        <h3 class="font-medium mb-3">✨ Gerar legenda com IA</h3>
+        <div class="space-y-3">
+          <input id="ai-tema" class="input" placeholder="Tema (ex: lançamento de curso)" />
+          <div class="grid grid-cols-2 gap-3">
+            <input id="ai-tom" class="input" placeholder="Tom (ex: descontraído)" />
+            <input id="ai-pub" class="input" placeholder="Público (ex: empreendedores)" />
+          </div>
+          <input id="ai-var" type="number" class="input" value="3" min="1" max="6" />
+          <button class="btn btn-brand w-full" id="ai-go">Gerar</button>
+          <div id="ai-out" class="space-y-2"></div>
+        </div>
+        <div class="text-right mt-3"><button class="btn btn-ghost text-sm" id="ai-close">Fechar</button></div>
+      </div>`;
+    document.body.appendChild(wrap);
+    wrap.querySelector('#ai-close').onclick = () => wrap.remove();
+    wrap.querySelector('#ai-go').onclick = async () => {
+      const out = wrap.querySelector('#ai-out'); out.innerHTML = '<p class="text-sm text-gray-500">Gerando...</p>';
+      try {
+        const vars = await generateCaption({
+          tema: wrap.querySelector('#ai-tema').value, tom: wrap.querySelector('#ai-tom').value,
+          publico: wrap.querySelector('#ai-pub').value, variacoes: parseInt(wrap.querySelector('#ai-var').value) || 3,
+        });
+        out.innerHTML = vars.map(v => `<button class="text-left text-sm w-full p-2 rounded-lg bg-surface-800 hover:bg-surface-700 border border-surface-700 break-words">${esc(v)}</button>`).join('');
+        out.querySelectorAll('button').forEach((b,i) => b.onclick = () => { onPick(vars[i]); wrap.remove(); });
+      } catch (e) { out.innerHTML = `<p class="text-sm text-red-400">Erro: ${esc(e.message)}</p>`; }
+    };
+  }
+
+  // ----- Helpers de mídia ----------------------------------------------------
+  const fileToDataUrl = (file) => new Promise((res) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(file); });
+  async function uploadToSupabase(file) {
+    const path = `${state.user.email.replace(/[^a-z0-9]/gi,'_')}/${uid()}_${file.name}`;
+    const { error } = await state.sb.storage.from('media').upload(path, file, { upsert: true });
+    if (error) { toast('Upload falhou: ' + error.message, 'error'); return await fileToDataUrl(file); }
+    return state.sb.storage.from('media').getPublicUrl(path).data.publicUrl;
+  }
+
+  // ===========================================================================
+  // BOOT
+  // ===========================================================================
+  initSupabase();
+  render();
+  // Scheduler local: roda a cada 30s enquanto a página está aberta.
+  setInterval(() => { if (state.user) runScheduler(); }, 30000);
+  </script>
+</body>
+</html>
